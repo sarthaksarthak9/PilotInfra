@@ -1,0 +1,441 @@
+#!/bin/bash
+
+# SSH Gateway for Multi-User Docker Containers
+# CLEAN VERSION - No visible system users, SSH goes directly to containers
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+USERS_DB="/var/lib/user-containers/users.db"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSH_KEYS_DIR="/var/lib/user-containers/ssh-keys"
+GATEWAY_USER="dockergw"
+
+# ============================
+# HELP
+# ============================
+show_help() {
+    echo -e "${BLUE}SSH Gateway for Container Access (CLEAN VERSION)${NC}"
+    echo ""
+    echo "Usage: $0 [command]"
+    echo ""
+    echo "Commands:"
+    echo "  setup           - Setup SSH gateway (one time)"
+    echo "  add-key <user>  - Add SSH public key for user"
+    echo "  remove-key <user> - Remove user's SSH access"
+    echo "  list            - List all SSH users"
+    echo "  test <user>     - Test user's SSH configuration"
+    echo ""
+    echo "Features:"
+    echo "  - No visible system users (only root)"
+    echo "  - Single gateway user for all SSH"
+    echo "  - SSH keys map directly to containers"
+    echo "  - Clean login screen"
+    echo ""
+    echo "After setup, users connect via:"
+    echo "  ssh -p 2222 -i ~/.ssh/id_ed25519 dockergw@server-ip"
+    echo "  ssh -i ~/.ssh/id_ed25519 dockergw@ssh.yourdomain.com -o ProxyCommand=\"cloudflared access ssh --hostname %h\""
+    echo ""
+}
+
+# ============================
+# SETUP SSH GATEWAY
+# ============================
+setup_gateway() {
+    echo -e "${YELLOW}Setting up CLEAN SSH gateway...${NC}"
+    echo ""
+    
+    # Check if running as root
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}Error: Must run as root${NC}"
+        exit 1
+    fi
+    
+    # Install dependencies
+    if ! command -v sshd &> /dev/null; then
+        echo "Installing OpenSSH server..."
+        if [ -f /etc/debian_version ]; then
+            apt-get update && apt-get install -y openssh-server
+        elif [ -f /etc/redhat-release ]; then
+            yum install -y openssh-server
+        else
+            echo -e "${RED}Error: Unsupported OS${NC}"
+            exit 1
+        fi
+    fi
+    
+    # Create gateway user (hidden from login screen)
+    if ! id "$GATEWAY_USER" &>/dev/null; then
+        # Create system user (UID < 1000, hidden from login)
+        useradd -r -m -d "/var/lib/$GATEWAY_USER" -s /bin/bash "$GATEWAY_USER"
+        # Add to docker group
+        usermod -aG docker "$GATEWAY_USER"
+        echo "✓ Created gateway user: $GATEWAY_USER (hidden)"
+    else
+        echo "✓ Gateway user exists: $GATEWAY_USER"
+    fi
+    
+    # Create SSH keys directory
+    mkdir -p "$SSH_KEYS_DIR"
+    chown "$GATEWAY_USER:$GATEWAY_USER" "$SSH_KEYS_DIR"
+    chmod 700 "$SSH_KEYS_DIR"
+    
+    # Create routing script
+    cat > /var/lib/user-containers/ssh-router.sh << 'ROUTEREOF'
+#!/bin/bash
+
+# SSH Router - Maps SSH keys to containers
+
+USERS_DB="/var/lib/user-containers/users.db"
+SSH_KEYS_DIR="/var/lib/user-containers/ssh-keys"
+
+# Get the SSH key fingerprint
+KEY_FINGERPRINT=$(echo "$SSH_CONNECTION" | awk '{print $1":"$2}')
+
+# Find which user this key belongs to
+USERNAME=""
+for keyfile in "$SSH_KEYS_DIR"/*.pub; do
+    if [ -f "$keyfile" ]; then
+        username=$(basename "$keyfile" .pub)
+        # Check if connecting key matches stored key
+        if ssh-keygen -l -f "$keyfile" 2>/dev/null | grep -q "$SSH_CONNECTION"; then
+            USERNAME="$username"
+            break
+        fi
+    fi
+done
+
+# If no username found, try environment variable
+if [ -z "$USERNAME" ]; then
+    USERNAME="${SSH_ORIGINAL_COMMAND%%@*}"
+fi
+
+# Still no username? Check by key file
+if [ -z "$USERNAME" ]; then
+    # Last resort - use key comment
+    for keyfile in "$SSH_KEYS_DIR"/*.pub; do
+        if [ -f "$keyfile" ]; then
+            USERNAME=$(basename "$keyfile" .pub)
+            break
+        fi
+    done
+fi
+
+if [ -z "$USERNAME" ]; then
+    echo "Error: Could not identify user"
+    exit 1
+fi
+
+# Get user's container
+if ! grep -q "^$USERNAME:" "$USERS_DB" 2>/dev/null; then
+    echo "Error: User not found: $USERNAME"
+    exit 1
+fi
+
+USER_DATA=$(grep "^$USERNAME:" "$USERS_DB")
+CONTAINER=$(echo "$USER_DATA" | cut -d: -f2)
+
+# Check if container is running
+if ! docker ps --format '{{.Names}}' | grep -q "^$CONTAINER$"; then
+    echo "Starting your container..."
+    docker start "$CONTAINER" > /dev/null 2>&1
+    sleep 2
+fi
+
+# Log access
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] SSH: $USERNAME -> $CONTAINER" >> /var/lib/user-containers/logs/access.log
+
+# Connect to container
+exec docker exec -it "$CONTAINER" /bin/bash
+ROUTEREOF
+    
+    chmod +x /var/lib/user-containers/ssh-router.sh
+    echo "✓ Created SSH router script"
+    
+    # Backup sshd_config
+    if [ ! -f "${SSHD_CONFIG}.backup" ]; then
+        cp "$SSHD_CONFIG" "${SSHD_CONFIG}.backup"
+        echo "✓ Backed up SSH config"
+    fi
+    
+    # Configure SSH
+    if ! grep -q "^Port 2222" "$SSHD_CONFIG"; then
+        echo "" >> "$SSHD_CONFIG"
+        echo "# Container Gateway Configuration (Clean)" >> "$SSHD_CONFIG"
+        echo "Port 2222" >> "$SSHD_CONFIG"
+        echo "PasswordAuthentication no" >> "$SSHD_CONFIG"
+        echo "PubkeyAuthentication yes" >> "$SSHD_CONFIG"
+        echo "PermitRootLogin no" >> "$SSHD_CONFIG"
+        echo "✓ Configured SSH on port 2222"
+    fi
+    
+    # Add gateway user ForceCommand
+    if ! grep -q "Match User $GATEWAY_USER" "$SSHD_CONFIG"; then
+        cat >> "$SSHD_CONFIG" << SSHEOF
+
+# Gateway user routing
+Match User $GATEWAY_USER
+    ForceCommand /var/lib/user-containers/ssh-router.sh
+    PermitTTY yes
+    PubkeyAuthentication yes
+SSHEOF
+        echo "✓ Configured SSH routing"
+    fi
+    
+    # Test SSH config
+    if ! sshd -t; then
+        echo -e "${RED}Error: Invalid SSH configuration${NC}"
+        exit 1
+    fi
+    
+    # Restart SSH
+    systemctl restart sshd || systemctl restart ssh
+    echo "✓ SSH service restarted"
+    
+    # Create log directory
+    mkdir -p /var/lib/user-containers/logs
+    
+    echo ""
+    echo -e "${GREEN}✓ CLEAN SSH gateway setup complete${NC}"
+    echo ""
+    echo "Features:"
+    echo "  - Only 'root' visible on login screen"
+    echo "  - Single gateway user '$GATEWAY_USER' for all SSH"
+    echo "  - SSH keys map directly to containers"
+    echo ""
+    echo "Next steps:"
+    echo "1. Create users: sudo ./multi-user-containers.sh create-user <username>"
+    echo "2. Add SSH keys: sudo $0 add-key <username>"
+    echo "3. Users connect: ssh -p 2222 -i ~/.ssh/id_ed25519 $GATEWAY_USER@server-ip"
+    echo ""
+}
+
+# ============================
+# ADD SSH KEY
+# ============================
+add_ssh_key() {
+    USERNAME="$1"
+    
+    if [ -z "$USERNAME" ]; then
+        echo -e "${RED}Error: Username required${NC}"
+        echo "Usage: $0 add-key <username>"
+        exit 1
+    fi
+    
+    # Check if user exists in database
+    if ! grep -q "^$USERNAME:" "$USERS_DB" 2>/dev/null; then
+        echo -e "${RED}Error: User '$USERNAME' not found${NC}"
+        echo "Create user first: sudo ./multi-user-containers.sh create-user $USERNAME"
+        exit 1
+    fi
+    
+    # Get container name
+    USER_DATA=$(grep "^$USERNAME:" "$USERS_DB")
+    CONTAINER=$(echo "$USER_DATA" | cut -d: -f2)
+    
+    # Get SSH public key
+    echo ""
+    echo -e "${YELLOW}Paste the user's SSH public key (from ~/.ssh/id_rsa.pub or ~/.ssh/id_ed25519.pub)${NC}"
+    echo "Press Enter when done:"
+    echo ""
+    
+    read -r SSH_KEY
+    
+    if [ -z "$SSH_KEY" ]; then
+        echo -e "${RED}Error: No key provided${NC}"
+        exit 1
+    fi
+    
+    # Save key to gateway user's authorized_keys
+    GATEWAY_HOME="/var/lib/$GATEWAY_USER"
+    mkdir -p "$GATEWAY_HOME/.ssh"
+    
+    # Add key with environment variable to identify user
+    echo "environment=\"CONTAINER_USER=$USERNAME\" $SSH_KEY" >> "$GATEWAY_HOME/.ssh/authorized_keys"
+    
+    # Also save to keys directory for reference
+    echo "$SSH_KEY" > "$SSH_KEYS_DIR/$USERNAME.pub"
+    
+    # Fix permissions
+    chown -R "$GATEWAY_USER:$GATEWAY_USER" "$GATEWAY_HOME/.ssh"
+    chmod 700 "$GATEWAY_HOME/.ssh"
+    chmod 600 "$GATEWAY_HOME/.ssh/authorized_keys"
+    
+    echo "✓ Added SSH key for $USERNAME"
+    
+    # Log access setup
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SSH key added: $USERNAME (clean mode)" >> /var/lib/user-containers/logs/access.log
+    
+    echo ""
+    echo -e "${GREEN}✓ SSH access configured for $USERNAME${NC}"
+    echo ""
+    echo "User connects with:"
+    echo "  ssh -p 2222 -i ~/.ssh/id_ed25519 $GATEWAY_USER@$(hostname -I | awk '{print $1}' 2>/dev/null || echo 'your-server-ip')"
+    echo ""
+    echo "Via Cloudflare Tunnel:"
+    echo "  ssh -i ~/.ssh/id_ed25519 $GATEWAY_USER@ssh.yourdomain.com -o ProxyCommand=\"cloudflared access ssh --hostname %h\""
+    echo ""
+    echo "Or add to ~/.ssh/config:"
+    echo "  Host mycontainer"
+    echo "    HostName ssh.yourdomain.com"
+    echo "    User $GATEWAY_USER"
+    echo "    ProxyCommand cloudflared access ssh --hostname %h"
+    echo ""
+}
+
+# ============================
+# REMOVE SSH KEY
+# ============================
+remove_ssh_key() {
+    USERNAME="$1"
+    
+    if [ -z "$USERNAME" ]; then
+        echo -e "${RED}Error: Username required${NC}"
+        echo "Usage: $0 remove-key <username>"
+        exit 1
+    fi
+    
+    GATEWAY_HOME="/var/lib/$GATEWAY_USER"
+    
+    # Remove from authorized_keys
+    if [ -f "$GATEWAY_HOME/.ssh/authorized_keys" ]; then
+        sed -i "/CONTAINER_USER=$USERNAME/d" "$GATEWAY_HOME/.ssh/authorized_keys"
+        echo "✓ Removed from authorized_keys"
+    fi
+    
+    # Remove key file
+    rm -f "$SSH_KEYS_DIR/$USERNAME.pub"
+    echo "✓ Removed key file"
+    
+    # Log removal
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] SSH key removed: $USERNAME" >> /var/lib/user-containers/logs/access.log
+    
+    echo ""
+    echo -e "${GREEN}✓ SSH access removed for $USERNAME${NC}"
+    echo ""
+}
+
+# ============================
+# LIST SSH USERS
+# ============================
+list_ssh_users() {
+    echo -e "${BLUE}=== SSH Users (Clean Mode) ===${NC}"
+    echo ""
+    
+    if [ ! -f "$USERS_DB" ]; then
+        echo "No users found"
+        return 0
+    fi
+    
+    printf "%-15s %-30s %-10s\n" "USERNAME" "CONTAINER" "SSH KEY"
+    echo "──────────────────────────────────────────────────────────"
+    
+    while IFS=: read -r username container _; do
+        if [ -f "$SSH_KEYS_DIR/$username.pub" ]; then
+            KEY_STATUS="✓ Yes"
+        else
+            KEY_STATUS="✗ No"
+        fi
+        printf "%-15s %-30s %-10s\n" "$username" "$container" "$KEY_STATUS"
+    done < "$USERS_DB"
+    
+    echo ""
+    echo "Gateway user: $GATEWAY_USER (system user, hidden from login)"
+    echo ""
+}
+
+# ============================
+# TEST SSH CONFIG
+# ============================
+test_ssh_config() {
+    USERNAME="$1"
+    
+    if [ -z "$USERNAME" ]; then
+        echo -e "${RED}Error: Username required${NC}"
+        echo "Usage: $0 test <username>"
+        exit 1
+    fi
+    
+    echo -e "${YELLOW}Testing CLEAN SSH configuration for $USERNAME...${NC}"
+    echo ""
+    
+    # Check user exists
+    if ! grep -q "^$USERNAME:" "$USERS_DB" 2>/dev/null; then
+        echo -e "${RED}✗ User not found in database${NC}"
+        exit 1
+    else
+        echo -e "${GREEN}✓ User exists in database${NC}"
+    fi
+    
+    # Get container
+    USER_DATA=$(grep "^$USERNAME:" "$USERS_DB")
+    CONTAINER=$(echo "$USER_DATA" | cut -d: -f2)
+    
+    # Check gateway user
+    if id "$GATEWAY_USER" &>/dev/null; then
+        echo -e "${GREEN}✓ Gateway user exists: $GATEWAY_USER${NC}"
+    else
+        echo -e "${RED}✗ Gateway user missing${NC}"
+    fi
+    
+    # Check SSH key
+    if [ -f "$SSH_KEYS_DIR/$USERNAME.pub" ]; then
+        echo -e "${GREEN}✓ SSH key configured${NC}"
+    else
+        echo -e "${RED}✗ No SSH key configured${NC}"
+    fi
+    
+    # Check container
+    if docker ps --format '{{.Names}}' | grep -q "^$CONTAINER$"; then
+        echo -e "${GREEN}✓ Container is running${NC}"
+    else
+        echo -e "${RED}✗ Container not running${NC}"
+    fi
+    
+    # Check router script
+    if [ -x /var/lib/user-containers/ssh-router.sh ]; then
+        echo -e "${GREEN}✓ SSH router script exists${NC}"
+    else
+        echo -e "${RED}✗ SSH router script missing${NC}"
+    fi
+    
+    echo ""
+    echo "User connects with:"
+    echo "  ssh -p 2222 -i ~/.ssh/id_ed25519 $GATEWAY_USER@$(hostname -I | awk '{print $1}' 2>/dev/null || echo 'server-ip')"
+    echo ""
+    echo "Benefits:"
+    echo "  ✓ No visible system users (only root)"
+    echo "  ✓ Clean login screen"
+    echo "  ✓ Single SSH user for all containers"
+    echo ""
+}
+
+# ============================
+# MAIN
+# ============================
+case "${1:-}" in
+    setup)
+        setup_gateway
+        ;;
+    add-key)
+        add_ssh_key "$2"
+        ;;
+    remove-key)
+        remove_ssh_key "$2"
+        ;;
+    list)
+        list_ssh_users
+        ;;
+    test)
+        test_ssh_config "$2"
+        ;;
+    *)
+        show_help
+        ;;
+esac
