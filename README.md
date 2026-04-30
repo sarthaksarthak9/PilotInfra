@@ -1,4 +1,4 @@
-# 🚀 DevOps Automation Suite
+# 🚀 PilotInfra
 
 Complete DevOps toolkit for deploying and managing:
 - **Sparkles** (Go microservices + React frontend)
