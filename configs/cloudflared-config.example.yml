@@ -1,0 +1,49 @@
+# Cloudflare Tunnel Configuration
+# Place in ~/.cloudflared/config.yml
+
+tunnel: YOUR_TUNNEL_ID_HERE
+credentials-file: /home/user/.cloudflared/YOUR_TUNNEL_ID_HERE.json
+
+# Ingress rules (order matters!)
+ingress:
+  # Sparkles API - Route by path
+  - hostname: api.yourdomain.com
+    path: /auth/*
+    service: http://localhost:8081
+  
+  - hostname: api.yourdomain.com
+    path: /dashboard/*
+    service: http://localhost:8082
+  
+  - hostname: api.yourdomain.com
+    path: /goals/*
+    service: http://localhost:8083
+  
+  - hostname: api.yourdomain.com
+    path: /vault/*
+    service: http://localhost:8084
+  
+  # Sparkles Web
+  - hostname: yourdomain.com
+    service: http://localhost:5173
+  
+  - hostname: www.yourdomain.com
+    service: http://localhost:5173
+  
+  # docs-portal
+  - hostname: docs.yourdomain.com
+    service: http://localhost:3032
+  
+  # OrchestAI
+  - hostname: orchestai.yourdomain.com
+    service: http://localhost:9000
+  
+  # Catch-all (404)
+  - service: http_status:404
+
+# Optional: Logging
+# loglevel: info
+# logfile: /var/log/cloudflared.log
+
+# Optional: Metrics
+# metrics: localhost:9100
