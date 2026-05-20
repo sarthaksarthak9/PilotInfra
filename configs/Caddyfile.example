@@ -1,0 +1,83 @@
+# Caddyfile for VPS Deployment
+# Place in /etc/caddy/Caddyfile
+
+# Replace 'yourdomain.com' with your actual domain
+
+# Sparkles API (4 microservices)
+api.yourdomain.com {
+    # Auth service
+    reverse_proxy /auth/* localhost:8081
+    
+    # Dashboard service
+    reverse_proxy /dashboard/* localhost:8082
+    
+    # Goals service
+    reverse_proxy /goals/* localhost:8083
+    
+    # Vault service
+    reverse_proxy /vault/* localhost:8084
+    
+    # Enable compression
+    encode gzip zstd
+    
+    # CORS headers
+    header {
+        Access-Control-Allow-Origin *
+        Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+        Access-Control-Allow-Headers "Content-Type, Authorization"
+    }
+}
+
+# Sparkles Web (Frontend)
+yourdomain.com {
+    # Vite preview or static files
+    reverse_proxy localhost:5173
+    
+    # Or serve static files directly:
+    # root * /var/www/sparkles-web/dist
+    # file_server
+    # try_files {path} /index.html
+    
+    encode gzip zstd
+    
+    header {
+        -Server
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        X-XSS-Protection "1; mode=block"
+    }
+}
+
+# docs-portal (Next.js)
+docs.yourdomain.com {
+    reverse_proxy localhost:3032
+    
+    encode gzip zstd
+}
+
+# OrchestAI
+orchestai.yourdomain.com {
+    reverse_proxy localhost:9000
+    
+    encode gzip zstd
+}
+
+# Optional: Redirect www to non-www
+www.yourdomain.com {
+    redir https://yourdomain.com{uri} permanent
+}
+
+# Optional: API documentation
+api-docs.yourdomain.com {
+    reverse_proxy localhost:8080
+}
+
+# Optional: Metrics endpoint (restrict access!)
+metrics.yourdomain.com {
+    reverse_proxy localhost:9090
+    
+    # Basic auth
+    basicauth {
+        admin $2a$14$Zkx19XLiW6VYouLHR5NmfOFU0z2GTNmpkT/5qqR7hx4wHAiAkMWIm
+    }
+}
